@@ -1,4 +1,4 @@
-module bb-e
+module bb
 
 go 1.22.2
 

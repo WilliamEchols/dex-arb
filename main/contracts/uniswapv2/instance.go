@@ -14,23 +14,41 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 
-  "bb-e/types"
+  "bb/types"
 )
 
 type Instance struct {
-  Address string
-  Client bind.ContractBackend
-  PairInterface *Uniswapv2pair
-  auth *bind.TransactOpts // auth is private
-  FeePerThousand int64
-  Asset1Name string
-  Asset2Name string
-  DEXName string
+	AddressString      string
+	Client             bind.ContractBackend
+	PairInterface      *Uniswapv2pair
+	auth               *bind.TransactOpts
+	FeePerThousand     int64
+	Asset1Name         string
+	Asset2Name         string
+	DEXName            string
+  Asset1Decimals     int64
+  Asset2Decimals     int64
+}
+
+func (i *Instance) Asset1() string {
+	return i.Asset1Name
+}
+
+func (i *Instance) Asset2() string {
+	return i.Asset2Name
+}
+
+func (i *Instance) DEX() string {
+	return i.DEXName
+}
+
+func (i *Instance) Address() string {
+	return i.AddressString
 }
 
 var wg sync.WaitGroup
 
-func NewInstance(address string, client bind.ContractBackend, privateKey *ecdsa.PrivateKey, chainId *big.Int, asset1name string, asset2name string) *Instance {
+func NewInstance(address string, client bind.ContractBackend, privateKey *ecdsa.PrivateKey, chainId *big.Int, asset1name string, asset2name string, asset1decimals int64, asset2decimals int64) *Instance {
   pair, err := NewUniswapv2pair(common.HexToAddress(address), client)
   if err != nil {
     log.Fatal(err)
@@ -42,7 +60,7 @@ func NewInstance(address string, client bind.ContractBackend, privateKey *ecdsa.
 	}
 
   return &Instance{
-    Address:        address,
+    AddressString:        address,
     Client:         client,
     PairInterface:  pair,
     auth:           auth,
@@ -50,38 +68,62 @@ func NewInstance(address string, client bind.ContractBackend, privateKey *ecdsa.
     Asset1Name:     asset1name,
     Asset2Name:     asset2name,
     DEXName:        "UniswapV2",
+    Asset1Decimals: asset1decimals,
+    Asset2Decimals: asset2decimals,
   }
 }
 
-// Returns forward (1->2), backward (2->1), and error
-func (d *Instance) GetAmountOut() (*big.Int, *big.Int, error) {
-  reserves, err := d.PairInterface.GetReserves(nil)
-  if err != nil {
-    return nil, nil, err
-  }
+func multiplyBy10PowX(value *big.Float, x int64) *big.Float {
+    ten := big.NewInt(10)
+    result := new(big.Float).Set(value) // Create a copy of the input value
 
-  amountIn := new(big.Int).Mul(big.NewInt(1), big.NewInt(1e18))
+    if x > 0 {
+        // Positive exponent: Calculate 10^x using big.Int
+        exponent := big.NewInt(x)
+        tenToThePowerOfX := new(big.Int).Exp(ten, exponent, nil)
+        floatTenToThePowerOfX := new(big.Float).SetInt(tenToThePowerOfX)
+        result.Mul(result, floatTenToThePowerOfX)
+    } else if x < 0 {
+        // Negative exponent: Calculate 10^(-x) and then take the reciprocal
+        exponent := big.NewInt(-x)
+        tenToThePowerOfX := new(big.Int).Exp(ten, exponent, nil)
+        floatTenToThePowerOfX := new(big.Float).SetInt(tenToThePowerOfX)
+        result.Quo(result, floatTenToThePowerOfX)
+    }
+    // If x == 0, result is simply the original value, as 10^0 = 1
 
-  reserveIn := reserves.Reserve0
-  reserveOut := reserves.Reserve1
+    return result
+}
 
-  amountInWithFee := new(big.Int).Mul(amountIn, big.NewInt(1000 - d.FeePerThousand))
-  numerator := new(big.Int).Mul(amountInWithFee, reserveOut)
-  denominator := new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(1000)), amountInWithFee)
-  forward := new(big.Int).Div(numerator, denominator)
+func (d *Instance) GetAmountOut() (*big.Float, *big.Float, error) {
+	amountIn := new(big.Float).Mul(big.NewFloat(1), big.NewFloat(1)) // 1e18 should be 1 asset
 
-  reserveIn = reserves.Reserve1
-  reserveOut = reserves.Reserve0
+	// Fetch reserves
+	reserves, err := d.PairInterface.GetReserves(nil)
+	if err != nil {
+		return nil, nil, err
+	}
 
-  numerator = new(big.Int).Mul(amountInWithFee, reserveOut)
-  denominator = new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(1000)), amountInWithFee)
-  backward := new(big.Int).Div(numerator, denominator)
+	// Calculate amountOut for both directions
+	amountOut1:= calculateAmountOut(amountIn, new(big.Float).SetInt(reserves.Reserve0), new(big.Float).SetInt(reserves.Reserve1))
+  amountOut2 := new(big.Float).Quo(big.NewFloat(1), amountOut1)
 
-  return forward, backward, nil
+  // Correct scaling for ETH/USDT
+  amountOut1Scaled := multiplyBy10PowX(amountOut1, d.Asset1Decimals - d.Asset2Decimals - 3)
+  amountOut2Scaled := multiplyBy10PowX(amountOut2, d.Asset2Decimals - d.Asset1Decimals - 3)
+
+	return new(big.Float).Mul(amountOut1Scaled, big.NewFloat(float64(1000 - d.FeePerThousand))), new(big.Float).Mul(amountOut2Scaled, big.NewFloat(float64(1000 - d.FeePerThousand))), nil
+}
+
+func calculateAmountOut(amountIn, reserveIn, reserveOut *big.Float) *big.Float {
+	numerator := new(big.Float).Mul(amountIn, reserveOut)
+	denominator := new(big.Float).Add(new(big.Float).Mul(reserveIn, big.NewFloat(1)), amountIn)
+	amountOut := new(big.Float).Quo(numerator, denominator)
+	return amountOut
 }
 
 func (d *Instance) Monitor(ctx context.Context, swapEventChan chan<- types.SwapEvent) {
-  defer wg.Done()
+	defer wg.Done()
 
   swapChan := make(chan *Uniswapv2pairSwap)
 
@@ -90,53 +132,37 @@ func (d *Instance) Monitor(ctx context.Context, swapEventChan chan<- types.SwapE
     log.Fatal(err)
   }
 
-  log.Printf("Subscribed to swap events for %s/%s on %s (%s)", d.Asset1Name, d.Asset2Name, d.DEXName, d.Address)
+	log.Printf("Listening for swap events: %s/%s on %s (%s)", d.Asset1Name, d.Asset2Name, d.DEXName, d.AddressString)
 
-  for {
-    select {
-	    case err := <-sub.Err():
-			  log.Fatalf("Subscription error: %v", err)
-      case <-ctx.Done():
-        return
-      case swap := <-swapChan:
-        _ = swap
+	for {
+		select {
+		case err := <-sub.Err():
+			log.Fatalf("Subscription error: %v", err)
+		case <-ctx.Done():
+			return
+		case swap := <-swapChan:
+			_ = swap
 
-        // Fetch reserves to calculate amountOut
-        reserves, err := d.PairInterface.GetReserves(nil)
-        if err != nil {
-          log.Fatalf("GetReserves in Monitor error: %v", err)
-          return 
-        }
+			// Get amounts out
+			forward, backward, err := d.GetAmountOut()
+			if err != nil {
+				log.Fatalf("GetAmountOut error: %v", err)
+				return
+			}
 
-        amountIn := new(big.Int).Mul(big.NewInt(1), big.NewInt(1e18))
+			amountOut := types.AmountOut{forward, backward}
 
-        reserveIn := reserves.Reserve0
-        reserveOut := reserves.Reserve1
-
-        amountInWithFee := new(big.Int).Mul(amountIn, big.NewInt(1000 - d.FeePerThousand))
-        numerator := new(big.Int).Mul(amountInWithFee, reserveOut)
-        denominator := new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(1000)), amountInWithFee)
-        forward := new(big.Int).Div(numerator, denominator)
-
-        reserveIn = reserves.Reserve1
-        reserveOut = reserves.Reserve0
-
-        numerator = new(big.Int).Mul(amountInWithFee, reserveOut)
-        denominator = new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(1000)), amountInWithFee)
-        backward := new(big.Int).Div(numerator, denominator)
-
-        amountOut := types.AmountOut{forward, backward}
-
-        swapEvent := types.SwapEvent{
-          DEXName:       d.DEXName,
-          Asset1Name:    d.Asset1Name,
-          Asset2Name:    d.Asset2Name,
-          Address:       d.Address,
-          AmountOut:     amountOut,
-        }
-        swapEventChan <- swapEvent
-    }
-  }
+			// Send update to channel
+			swapEvent := types.SwapEvent{
+				DEXName:    d.DEXName,
+				Asset1Name: d.Asset1Name,
+				Asset2Name: d.Asset2Name,
+				Address:    d.AddressString,
+				AmountOut:  amountOut,
+			}
+			swapEventChan <- swapEvent
+		}
+	}
 }
 
 func (d *Instance) ExecuteSwap(amountIn1, amountIn2 *big.Int) error {

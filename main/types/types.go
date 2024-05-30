@@ -6,14 +6,17 @@ import (
 )
 
 type Pair interface {
-  GetAmountOut() (*big.Int, *big.Int, error)
-  Monitor(ctx context.Context, swapEventChan chan<- SwapEvent)
-  ExecuteSwap(amountIn1, amountIn2 *big.Int) error 
+	Monitor(ctx context.Context, swapEventChan chan<- SwapEvent)
+	ExecuteSwap(amountIn1, amountIn2 *big.Int) error
+	Asset1() string
+	Asset2() string
+	DEX() string
+	Address() string
 }
 
 type AmountOut struct {
-  Amount1 *big.Int
-  Amount2 *big.Int
+  Amount1 *big.Float
+  Amount2 *big.Float
 }
 
 type SwapEvent struct {
